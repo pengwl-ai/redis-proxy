@@ -107,6 +107,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		conn:   conn,
 		pool:   s.pool,
 		reader: bufio.NewReaderSize(conn, 64*1024),
+		writer: bufio.NewWriterSize(conn, 64*1024),
 		logger: logger,
 	}
 

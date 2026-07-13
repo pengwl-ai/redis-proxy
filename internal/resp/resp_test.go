@@ -196,11 +196,33 @@ func TestReadCommandLowerCase(t *testing.T) {
 	}
 }
 
-func TestReadCommandNotArray(t *testing.T) {
-	r := bufio.NewReader(strings.NewReader("+PING\r\n"))
-	_, _, err := ReadCommand(context.Background(), r)
-	if err == nil {
-		t.Fatal("expected error for non-array command")
+func TestReadCommandInline(t *testing.T) {
+	// Inline PING (redis-benchmark PING_INLINE mode)
+	r := bufio.NewReader(strings.NewReader("PING\r\n"))
+	cmd, raw, err := ReadCommand(context.Background(), r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmd != "PING" {
+		t.Errorf("expected PING, got %q", cmd)
+	}
+	if string(raw) != "PING\r\n" {
+		t.Errorf("expected 'PING\\r\\n', got %q", string(raw))
+	}
+}
+
+func TestReadCommandInlineMultiWord(t *testing.T) {
+	// Inline SET with arguments
+	r := bufio.NewReader(strings.NewReader("SET key value\r\n"))
+	cmd, raw, err := ReadCommand(context.Background(), r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmd != "SET" {
+		t.Errorf("expected SET, got %q", cmd)
+	}
+	if string(raw) != "SET key value\r\n" {
+		t.Errorf("expected 'SET key value\\r\\n', got %q", string(raw))
 	}
 }
 

@@ -1,11 +1,17 @@
 proxy:
   listen: "0.0.0.0:6379"
   api_listen: "0.0.0.0:8080"
+  pool_size: 20
+  max_pool_size: 100
 
 backends:
   - name: "dc1"
     addr: "192.168.31.200:6379"
     role: primary
+    pool_size: 2000
+    max_pool_size: 10000
   - name: "dc2"
     addr: "192.168.31.110:6379"
     role: standby
+    pool_size: 2000
+    max_pool_size: 10000

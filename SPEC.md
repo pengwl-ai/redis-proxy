@@ -303,3 +303,128 @@ go run ./cmd/bench -mode=perf    # 性能压测
 - 篡改后端 Redis 回复内容
 - 在代理层实施访问控制
 - 修改 Redis 后端的数据
+
+---
+
+## 7. Task3：性能优化 — 后端连接池 + Pipeline 批转发
+
+> 基线：代理 2,241 QPS vs 直连 Redis 88,245 QPS（~40x 差距）
+> 根因：每 Backend 单连接 + 全局互斥锁，所有并发客户端串行排队
+
+### 7.1 后端连接池
+
+当前每个 Backend 只有 1 个 `net.Conn`，`Forward()` 用 `b.mu.Lock()` 串行化所有访问。改为 per-Backend 连接池。
+
+#### 数据结构
+
+```go
+type pooledConn struct {
+    conn   net.Conn
+    reader *bufio.Reader
+}
+
+type Backend struct {
+    Name    string
+    Addr    string
+    Role    Role
+
+    pool       chan *pooledConn   // 可用连接
+    poolSize   int                // 池大小上限
+    maxPool    int                // 最大连接数
+    sem        chan struct{}      // 信号量（控制并发获取）
+    
+    onDisconnect func()
+    reconnecting atomic.Bool
+}
+```
+
+#### 连接获取/归还
+
+```
+acquire(ctx):
+  1. 从 pool channel 非阻塞取 → 拿到直接返回
+  2. pool 空 → 尝试 sem 获取槽位 → 创建新连接 → 返回
+  3. sem 满 → 阻塞等待 pool channel 或 ctx 取消
+
+release(pc):
+  pc 健康 → pool <- pc
+  pc 断开 → close(pc.conn), sem <- {}（释放槽位），触发 tryReconnect
+```
+
+#### Pool 大小配置
+
+| 层级 | 默认值 | 说明 |
+|------|--------|------|
+| `pool_size` | 20 | 预建/常驻连接数，对标 go-redis `PoolSize` |
+| `max_pool_size` | 100 | 连接数上限，对标 go-redis `PoolSize` 硬上限 |
+| `min_idle` | 5 | 最低保活连接数 |
+
+配置项添加到 `config.yaml` 的 backend 条目和全局默认值。
+
+#### 重连逻辑适配
+
+连接断开时：
+1. 坏连接从池中移除（不归还）
+2. 异步创建新连接补充到池中
+3. 若所有连接断开 → 触发全局 reconnect loop（现有逻辑复用）
+
+### 7.2 Pipeline 批转发
+
+当前 session 逐条 read-forward-write，即使客户端 pipeline 了 10 条命令，代理也是逐条等待后端回复。
+
+优化：session 检测到 reader buffer 中有多个完整命令时，批量转发到后端。
+
+#### 实现
+
+```
+Run() 主循环改为：
+  1. ReadCommand() → 读取第一条
+  2. 检测 reader.Buffered() > 0 → 批量读取剩余命令
+  3. 将 N 条命令的 raw bytes 拼接 → 调用 backend.ForwardBatch(raws)
+  4. ForwardBatch 通过连接池获取一条连接，连续写入 N 条，再连续读取 N 条回复
+  5. 将 N 条回复按序写回客户端
+```
+
+#### Backend.ForwardBatch
+
+```go
+func (b *Backend) ForwardBatch(ctx context.Context, raws [][]byte) ([][]byte, error) {
+    pc, err := b.acquire(ctx)
+    if err != nil {
+        return nil, err
+    }
+    defer b.release(pc)
+    
+    // Pipeline write
+    for _, raw := range raws {
+        pc.conn.Write(raw)
+    }
+    // Pipeline read (顺序对应)
+    replies := make([][]byte, len(raws))
+    for i := range raws {
+        msg, err := resp.ReadMessage(ctx, pc.reader)
+        if err != nil {
+            b.removeConn(pc)
+            return nil, err
+        }
+        replies[i] = msg.Bytes()
+    }
+    return replies, nil
+}
+```
+
+### 7.3 验收标准
+
+- `redis-benchmark -t set -n 100000 -c 100 -q` 通过代理应达到直连的 **50% 以上** QPS
+- 所有已有测试通过，无回归
+- Pool 配置可通过 `config.yaml` 调整
+
+### 7.4 变更文件
+
+| 文件 | 操作 | 说明 |
+|------|------|------|
+| `internal/backend/backend.go` | 重写 | 单连接 → 连接池 + Forward/ForwardBatch |
+| `internal/backend/pool.go` | 修改 | 适配新 Backend 接口 |
+| `internal/proxy/session.go` | 修改 | 支持批量读取 + batch 转发 |
+| `internal/config/config.go` | 修改 | 新增 pool_size / max_pool_size 配置字段 |
+| `config.yaml` | 修改 | 新增连接池配置示例 |

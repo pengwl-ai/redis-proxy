@@ -46,7 +46,17 @@ func ReadCommand(ctx context.Context, r *bufio.Reader) (cmd string, raw []byte, 
 		return "", nil, err
 	}
 	if b != '*' {
-		return "", nil, fmt.Errorf("resp: expected array '*, got %q", b)
+		// Inline command: space-separated arguments terminated by \r\n.
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return "", nil, err
+		}
+		raw := append([]byte{b}, []byte(line)...)
+		parts := strings.Fields(strings.TrimRight(string(raw), "\r\n"))
+		if len(parts) == 0 {
+			return "", nil, fmt.Errorf("resp: empty inline command")
+		}
+		return strings.ToUpper(parts[0]), raw, nil
 	}
 
 	var buf bytes.Buffer

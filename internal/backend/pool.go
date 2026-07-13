@@ -33,6 +33,17 @@ func NewPool(ctx context.Context, entries []config.BackendEntry, logger *slog.Lo
 
 	for _, e := range entries {
 		b := NewBackend(e.Name, e.Addr, Role(e.Role))
+
+		poolSize := e.PoolSize
+		if poolSize <= 0 {
+			poolSize = 4
+		}
+		maxPool := e.MaxPoolSize
+		if maxPool <= 0 {
+			maxPool = 20
+		}
+		b.SetPoolConfig(poolSize, maxPool)
+
 		b.SetOnDisconnect(func() {
 			p.reconnectLoop(b)
 		})

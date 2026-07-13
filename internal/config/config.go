@@ -15,14 +15,18 @@ type Config struct {
 }
 
 type ProxyConfig struct {
-	Listen    string `yaml:"listen"`
-	APIListen string `yaml:"api_listen"`
+	Listen      string `yaml:"listen"`
+	APIListen   string `yaml:"api_listen"`
+	PoolSize    int    `yaml:"pool_size"`
+	MaxPoolSize int    `yaml:"max_pool_size"`
 }
 
 type BackendEntry struct {
-	Name string `yaml:"name"`
-	Addr string `yaml:"addr"`
-	Role string `yaml:"role"`
+	Name        string `yaml:"name"`
+	Addr        string `yaml:"addr"`
+	Role        string `yaml:"role"`
+	PoolSize    int    `yaml:"pool_size"`
+	MaxPoolSize int    `yaml:"max_pool_size"`
 }
 
 func Load(path string) (*Config, error) {
@@ -41,6 +45,12 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Proxy.APIListen == "" {
 		cfg.Proxy.APIListen = "0.0.0.0:8080"
+	}
+	if cfg.Proxy.PoolSize <= 0 {
+		cfg.Proxy.PoolSize = 4
+	}
+	if cfg.Proxy.MaxPoolSize <= 0 {
+		cfg.Proxy.MaxPoolSize = 20
 	}
 
 	if err := cfg.validate(); err != nil {
