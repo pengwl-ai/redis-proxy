@@ -1,0 +1,7 @@
+*.exe
+
+/.vscode
+
+.idea
+/tools/bbc-tool
+/bin/encrypt-tool

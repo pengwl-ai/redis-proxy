@@ -1,0 +1,11 @@
+proxy:
+  listen: "0.0.0.0:6379"
+  api_listen: "0.0.0.0:8080"
+
+backends:
+  - name: "dc1"
+    addr: "192.168.31.200:6379"
+    role: primary
+  - name: "dc2"
+    addr: "192.168.31.110:6379"
+    role: standby
