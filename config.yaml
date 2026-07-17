@@ -1,8 +1,6 @@
 proxy:
-  listen: "0.0.0.0:6379"
+  listen: "0.0.0.0:6666"
   api_listen: "0.0.0.0:8080"
-  pool_size: 20
-  max_pool_size: 100
 
 backends:
   - name: "dc1"

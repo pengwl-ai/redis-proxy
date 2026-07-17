@@ -16,6 +16,8 @@ type Pool struct {
 	backends map[string]*Backend
 	primary  atomic.Pointer[Backend]
 
+	standbysSnapshot atomic.Pointer[[]*Backend]
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	logger *slog.Logger
@@ -68,6 +70,8 @@ func NewPool(ctx context.Context, entries []config.BackendEntry, logger *slog.Lo
 		return nil, errors.New("no primary backend configured or reachable")
 	}
 
+	p.buildStandbysSnapshot()
+
 	for _, b := range p.backends {
 		if !b.IsConnected() {
 			go p.reconnectLoop(b)
@@ -79,6 +83,24 @@ func NewPool(ctx context.Context, entries []config.BackendEntry, logger *slog.Lo
 
 func (p *Pool) Primary() *Backend {
 	return p.primary.Load()
+}
+
+func (p *Pool) CachedStandbys() []*Backend {
+	snapshot := p.standbysSnapshot.Load()
+	if snapshot == nil {
+		return nil
+	}
+	return *snapshot
+}
+
+func (p *Pool) buildStandbysSnapshot() {
+	var standbys []*Backend
+	for _, b := range p.backends {
+		if b.Role == RoleStandby {
+			standbys = append(standbys, b)
+		}
+	}
+	p.standbysSnapshot.Store(&standbys)
 }
 
 func (p *Pool) Standbys() []*Backend {
@@ -143,6 +165,8 @@ func (p *Pool) Promote(name string) (string, error) {
 	p.primary.Store(newPrimary)
 	oldPrimary.SetRole(RoleStandby)
 	newPrimary.SetRole(RolePrimary)
+
+	p.buildStandbysSnapshot()
 
 	if !oldPrimary.IsConnected() {
 		go p.reconnectLoop(oldPrimary)

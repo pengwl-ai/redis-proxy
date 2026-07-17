@@ -428,3 +428,224 @@ func (b *Backend) ForwardBatch(ctx context.Context, raws [][]byte) ([][]byte, er
 | `internal/proxy/session.go` | 修改 | 支持批量读取 + batch 转发 |
 | `internal/config/config.go` | 修改 | 新增 pool_size / max_pool_size 配置字段 |
 | `config.yaml` | 修改 | 新增连接池配置示例 |
+
+---
+
+## 8. Task4：pprof 性能分析集成
+
+> 日期：2026-07-15
+> 背景：压测显示代理吞吐量约为直连 Redis 的 44%（87,616 vs 198,452 ops/sec），p99 延迟退化 3 倍。需通过 pprof 定位代理层 CPU/内存/goroutine 热点。
+> 仅追加 pprof 路由，不修改代理核心逻辑。
+
+### 8.1 目标
+
+在现有 Gin API Server 上挂载 Go 标准库 `net/http/pprof` 端点，使开发者可以在压测期间采集 CPU profile、heap profile 和 goroutine dump，定位性能瓶颈的具体代码路径。
+
+**目标用户**：开发者，通过 `go tool pprof` 分析 proxy 进程。
+
+### 8.2 核心功能与验收标准
+
+#### 8.2.1 pprof 端点
+
+复用现有 API Server（`0.0.0.0:8080`），在 `/debug/pprof/` 路径下挂载标准 pprof handlers：
+
+| 端点 | Handler | 用途 |
+|------|---------|------|
+| `GET /debug/pprof/` | `pprof.Index` | HTML 索引页，列出所有 profile 链接 |
+| `GET /debug/pprof/cmdline` | `pprof.Cmdline` | 进程启动命令行 |
+| `GET /debug/pprof/profile` | `pprof.Profile` | CPU profile（?seconds=30） |
+| `GET /debug/pprof/symbol` | `pprof.Symbol` | 符号表查询 |
+| `GET /debug/pprof/trace` | `pprof.Trace` | 执行追踪 |
+| `GET /debug/pprof/heap` | `pprof.Handler("heap")` | 堆内存分配 |
+| `GET /debug/pprof/goroutine` | `pprof.Handler("goroutine")` | goroutine 堆栈 |
+| `GET /debug/pprof/allocs` | `pprof.Handler("allocs")` | 内存分配采样 |
+| `GET /debug/pprof/block` | `pprof.Handler("block")` | 阻塞事件分析 |
+| `GET /debug/pprof/mutex` | `pprof.Handler("mutex")` | 锁竞争分析 |
+
+#### 8.2.2 验收标准
+
+- [ ] `curl http://localhost:8080/debug/pprof/` 返回 HTML 索引页
+- [ ] 压测期间 `go tool pprof http://<host>:8080/debug/pprof/profile?seconds=30` 能采集 CPU profile
+- [ ] 压测后 `go tool pprof http://<host>:8080/debug/pprof/heap` 能查看内存分配热点
+- [ ] 已有测试全部通过，pprof 路由注册不影响现有 API 端点
+
+### 8.3 实现方案
+
+#### 修改文件
+
+| 文件 | 操作 | 说明 |
+|------|------|------|
+| `internal/api/handler.go` | 修改 | 在 `SetupRoutes` 中注册 pprof 路由组 |
+
+#### 实现细节
+
+在 `SetupRoutes` 方法中添加 pprof 路由组：
+
+```go
+import "net/http/pprof"
+
+func (h *Handler) SetupRoutes(r *gin.Engine) {
+    // pprof
+    pprofGroup := r.Group("/debug/pprof")
+    {
+        pprofGroup.GET("/", gin.WrapH(http.HandlerFunc(pprof.Index)))
+        pprofGroup.GET("/cmdline", gin.WrapH(http.HandlerFunc(pprof.Cmdline)))
+        pprofGroup.GET("/profile", gin.WrapH(http.HandlerFunc(pprof.Profile)))
+        pprofGroup.GET("/symbol", gin.WrapH(http.HandlerFunc(pprof.Symbol)))
+        pprofGroup.GET("/trace", gin.WrapH(http.HandlerFunc(pprof.Trace)))
+        pprofGroup.GET("/:name", gin.WrapH(pprof.Handler("")))
+    }
+
+    // 现有业务路由
+    v1 := r.Group("/api/v1")
+    // ...
+}
+```
+
+关键点：
+- `/:name` 用 `gin.WrapH(pprof.Handler(""))` 处理 — Gin 会将 `:name` 参数注入 `r.URL.Path`，pprof.Handler 从 URL path 读取 profile 名称，正常工作
+- 不新增依赖（`net/http/pprof` 是标准库）
+- 不新增配置项，pprof 随 API Server 始终启用（开发/测试环境）
+
+### 8.4 性能分析方法
+
+在压测期间采集 CPU profile，对比直连 Redis 定位代理开销来源：
+
+```bash
+# 1. 启动压测（走代理）
+memtier_benchmark -h 127.0.0.1 -p 6666 --ratio=8:2 --threads=10 --clients=50 -n 1000 --data-size=1024 --key-pattern=S:R
+
+# 2. 同时采集 30s CPU profile
+go tool pprof -http=:9090 http://192.168.31.200:8080/debug/pprof/profile?seconds=30
+
+# 3. 压测结束后采集 heap
+go tool pprof -http=:9090 http://192.168.31.200:8080/debug/pprof/heap
+
+# 4. 查看 goroutine 数量和状态
+curl http://192.168.31.200:8080/debug/pprof/goroutine?debug=1
+```
+
+预期分析维度：
+- **CPU 热点**：RESP 解析（`resp.ReadCommand`）vs 网络 I/O（`Forward`）vs 连接池获取/归还开销
+- **内存分配**：`bufio.Reader/Writer` buffer 分配、RESP 消息序列化/反序列化的临时对象
+- **goroutine 数量**：高并发下的 goroutine 总数和阻塞状态（I/O wait、channel wait）
+- **锁竞争**：`sync.Mutex` 和 channel 操作的等待时间（需启用 `mutex`/`block` profile）
+
+### 8.5 代码风格
+
+- 使用标准库 `net/http/pprof`，不引入第三方 profiling 库
+- 复用现有 API Server 端口，不另开端口
+- pprof 路由不加认证/鉴权（开发测试环境）
+
+### 8.6 边界
+
+#### Always
+- pprof 始终随 API Server 启动
+- 使用标准库，零新依赖
+
+#### Ask First
+- 如需限制 pprof 仅监听 localhost，先确认
+- 如需在 `main.go` 启动时打印 pprof URL，先确认
+
+#### Never
+- 不在 RESP proxy 端口（6666）暴露 pprof
+- 不在 pprof 路径上加业务鉴权逻辑
+
+---
+
+## 9. Task5：单连接延迟基准测试脚本
+
+> 日期：2026-07-17
+> 目标：编写一个最小化的 Go 脚本，通过单 TCP 连接发送 1 万次请求，精确测量端到端耗时，对比直连 Redis 与走代理的性能差异。
+
+### 9.1 目标
+
+提供一个零依赖、可复现的基准测试脚本，排除连接池、并发竞争、key miss 等干扰因素，纯粹测量代理层引入的延迟放大倍数。
+
+**目标用户**：开发者，快速验证每次代码变更后的代理延迟开销。
+
+### 9.2 核心功能与验收标准
+
+#### 9.2.1 功能
+
+- 使用 `net.Dial` 建立**单条** TCP 连接
+- 手动构造 RESP2 协议格式的 SET/GET 命令（不依赖任何 Redis 客户端库）
+- 连续发送 10,000 次请求（SET 和 GET 交替），每次发送后等待读取回复再发下一条
+- 记录第一条请求发送前到最后一包回复读完的**墙上时钟耗时**
+- 输出：总请求数、总耗时、平均 QPS（requests/sec）、平均单次延迟
+
+#### 9.2.2 使用方式
+
+```bash
+# 直连 Redis 基线
+go run ./test/latency_bench.go -addr=127.0.0.1:6379
+
+# 走代理
+go run ./test/latency_bench.go -addr=127.0.0.1:6666
+```
+
+#### 9.2.3 输出格式
+
+```
+target:       127.0.0.1:6379
+requests:     10000
+elapsed:      523ms
+qps:          19120
+avg latency:  0.052ms
+```
+
+#### 9.2.4 验收标准
+
+- [ ] 对直连 Redis 和代理各运行一次，输出 QPS 和平均延迟
+- [ ] 脚本不超过 150 行 Go 代码
+- [ ] 不依赖 `internal/` 包（完全独立，可单独 `go run`）
+- [ ] 不做并发，严格串行：发一条 → 读一条 → 发下一条
+
+### 9.3 项目结构
+
+```
+redis-proxy/
+├── test/
+│   └── latency_bench.go    # 单连接基准测试脚本
+```
+
+### 9.4 实现方案
+
+```
+main():
+  1. flag 解析 -addr（默认 127.0.0.1:6379）
+  2. 构造 SET/GET 两个 RESP 命令的 raw bytes：
+     SET: *3\r\n$3\r\nSET\r\n$4\r\nkey1\r\n$6\r\nvalue1\r\n
+     GET: *2\r\n$3\r\nGET\r\n$4\r\nkey1\r\n
+  3. net.Dial("tcp", addr) → conn
+  4. start := time.Now()
+  5. for i := 0; i < 10000; i++ {
+       conn.Write(setBytes 或 getBytes 交替)
+       conn.Read(buf)  // 读到 \r\n 确认完成
+     }
+  6. elapsed := time.Since(start)
+  7. 打印统计
+```
+
+关键细节：
+- 使用 `bufio.Reader` 包装 `conn`，逐 RESP 消息读完整回复
+- SET 回复为 `+OK\r\n`（5 字节），GET 回复为 `$6\r\nvalue1\r\n`，需根据 RESP 首字节正确消费不同长度的回复
+- 不依赖 `internal/resp` 包，脚本完全自包含
+
+### 9.5 代码风格
+
+- 标准 Go 惯例，单文件，package main
+- 零外部依赖（仅标准库：`flag`、`fmt`、`net`、`time`、`bufio`、`os`）
+- 变量名清晰，不做过度抽象
+
+### 9.6 边界
+
+#### Always
+- 严格串行：write → read → write（模拟真实单连接场景）
+- 使用固定的 key/value（key1/value1），确保 SET 操作每次覆盖同一个 key
+- RESP 协议手动构造，零依赖
+
+#### Never
+- 不引入任何第三方库（包括 go-redis）
+- 不依赖项目 internal 包
+- 不做并发测试（保持纯粹的单连接延迟测量）

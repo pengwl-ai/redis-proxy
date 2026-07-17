@@ -2,10 +2,16 @@ package resp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"strings"
 	"testing"
 )
+
+func readCommandTest(r *bufio.Reader) (string, []byte, error) {
+	var buf bytes.Buffer
+	return ReadCommand(context.Background(), r, &buf)
+}
 
 func TestReadSimpleString(t *testing.T) {
 	r := bufio.NewReader(strings.NewReader("+OK\r\n"))
@@ -172,7 +178,7 @@ func TestReadNestedArray(t *testing.T) {
 func TestReadCommand(t *testing.T) {
 	input := "*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n"
 	r := bufio.NewReader(strings.NewReader(input))
-	cmd, raw, err := ReadCommand(context.Background(), r)
+	cmd, raw, err := readCommandTest(r)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +193,7 @@ func TestReadCommand(t *testing.T) {
 func TestReadCommandLowerCase(t *testing.T) {
 	input := "*2\r\n$3\r\nget\r\n$3\r\nkey\r\n"
 	r := bufio.NewReader(strings.NewReader(input))
-	cmd, _, err := ReadCommand(context.Background(), r)
+	cmd, _, err := readCommandTest(r)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +205,7 @@ func TestReadCommandLowerCase(t *testing.T) {
 func TestReadCommandInline(t *testing.T) {
 	// Inline PING (redis-benchmark PING_INLINE mode)
 	r := bufio.NewReader(strings.NewReader("PING\r\n"))
-	cmd, raw, err := ReadCommand(context.Background(), r)
+	cmd, raw, err := readCommandTest(r)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +220,7 @@ func TestReadCommandInline(t *testing.T) {
 func TestReadCommandInlineMultiWord(t *testing.T) {
 	// Inline SET with arguments
 	r := bufio.NewReader(strings.NewReader("SET key value\r\n"))
-	cmd, raw, err := ReadCommand(context.Background(), r)
+	cmd, raw, err := readCommandTest(r)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +235,7 @@ func TestReadCommandInlineMultiWord(t *testing.T) {
 func TestReadCommandMemoryUsage(t *testing.T) {
 	input := "*3\r\n$6\r\nMEMORY\r\n$5\r\nUSAGE\r\n$3\r\nkey\r\n"
 	r := bufio.NewReader(strings.NewReader(input))
-	cmd, raw, err := ReadCommand(context.Background(), r)
+	cmd, raw, err := readCommandTest(r)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,12 +250,52 @@ func TestReadCommandMemoryUsage(t *testing.T) {
 func TestReadCommandScriptLoad(t *testing.T) {
 	input := "*3\r\n$6\r\nSCRIPT\r\n$4\r\nLOAD\r\n$10\r\nreturn 123\r\n"
 	r := bufio.NewReader(strings.NewReader(input))
-	cmd, _, err := ReadCommand(context.Background(), r)
+	cmd, _, err := readCommandTest(r)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cmd != "SCRIPT LOAD" {
 		t.Errorf("expected 'SCRIPT LOAD', got %q", cmd)
+	}
+}
+
+func TestReadCommandSharedBuffer(t *testing.T) {
+	// Pipeline batching appends multiple commands to one buffer; earlier raw
+	// slices must stay intact even after the buffer grows.
+	inputs := []string{
+		"*2\r\n$3\r\nGET\r\n$4\r\nkey1\r\n",
+		"*3\r\n$3\r\nSET\r\n$4\r\nkey2\r\n$1024\r\n" + strings.Repeat("v", 1024) + "\r\n",
+		"*2\r\n$3\r\nDEL\r\n$4\r\nkey3\r\n",
+	}
+	r := bufio.NewReader(strings.NewReader(strings.Join(inputs, "")))
+	var buf bytes.Buffer
+
+	var raws [][]byte
+	for range inputs {
+		_, raw, err := ReadCommand(context.Background(), r, &buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raws = append(raws, raw)
+	}
+	for i, raw := range raws {
+		if string(raw) != inputs[i] {
+			t.Errorf("command %d: raw bytes mismatch: got %q", i, string(raw))
+		}
+	}
+}
+
+func BenchmarkReadCommand(b *testing.B) {
+	input := "*3\r\n$3\r\nSET\r\n$16\r\nmemtier-12345678\r\n$1024\r\n" + strings.Repeat("x", 1024) + "\r\n"
+	var buf bytes.Buffer
+	r := bufio.NewReader(nil)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		r.Reset(strings.NewReader(input))
+		buf.Reset()
+		if _, _, err := ReadCommand(context.Background(), r, &buf); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

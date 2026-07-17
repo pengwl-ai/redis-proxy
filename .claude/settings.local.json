@@ -6,7 +6,21 @@
       "Bash(go get *)",
       "Bash(go build *)",
       "Bash(go vet *)",
-      "Bash(go test *)"
+      "Bash(go test *)",
+      "Bash(go run *)",
+      "Bash(xxd)",
+      "Bash(sed -i 's/s\\\\.writer\\\\.Write\\(\\\\[\\\\]byte\\(fmt\\\\.Sprintf\\(\"-ERR backend error: %v\\\\\\\\r\\\\\\\\n\", fwdErr\\)\\)\\)/fmt.Fprintf\\(s.writer, \"-ERR backend error: %v\\\\\\\\r\\\\\\\\n\", fwdErr\\)/g' internal/proxy/session.go)",
+      "Bash(sed -i 's/s\\\\.writer\\\\.Write\\(\\\\[\\\\]byte\\(fmt\\\\.Sprintf\\(\"-ERR backend error: %v\\\\\\\\r\\\\\\\\n\", err\\)\\)\\)/fmt.Fprintf\\(s.writer, \"-ERR backend error: %v\\\\\\\\r\\\\\\\\n\", err\\)/g' internal/proxy/session.go)",
+      "Bash(export GOOS=linux)",
+      "Bash(scp redis-proxy *)",
+      "Bash(ssh *)",
+      "Bash(scp *)",
+      "Bash(scp.exe *)",
+      "Bash(go env *)",
+      "Bash(unset GOOS)",
+      "Bash(go tool *)",
+      "Bash(timeout 3 bash -c 'echo > /dev/tcp/192.168.31.200/6379 && echo \"redis OK\" || echo \"redis FAIL\"')",
+      "Bash(timeout 3 bash -c 'echo > /dev/tcp/192.168.31.200/6666 && echo \"proxy OK\" || echo \"proxy FAIL\"')"
     ]
   }
 }

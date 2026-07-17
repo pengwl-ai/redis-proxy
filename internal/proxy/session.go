@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -54,7 +55,7 @@ var standbyForwardCommands = map[string]bool{
 	"SADD": true, "SREM": true, "SPOP": true,
 	"ZADD": true, "ZPOPMIN": true,
 	"SETBIT": true,
-	"EVAL": true, "SCRIPT LOAD": true,
+	"EVAL":   true, "SCRIPT LOAD": true,
 	"AUTH": true, "SELECT": true,
 }
 
@@ -66,8 +67,16 @@ type Session struct {
 	writer *bufio.Writer
 	logger *slog.Logger
 
-	txConn *backend.PinnedConn
+	// cmdBuf backs the raw slices returned by resp.ReadCommand; reset at the
+	// top of each Run iteration, so raw is only valid within one iteration.
+	cmdBuf bytes.Buffer
+
+	txConn    *backend.PinnedConn
+	forwarder *standbyForwarder
 }
+
+// Commands larger than this are not worth keeping buffered per session.
+const maxRetainedCmdBuf = 1 << 20
 
 func (s *Session) Run(ctx context.Context) error {
 	defer s.conn.Close()
@@ -87,7 +96,12 @@ func (s *Session) Run(ctx context.Context) error {
 			return err
 		}
 
-		cmd, raw, err := resp.ReadCommand(ctx, s.reader)
+		if s.cmdBuf.Cap() > maxRetainedCmdBuf {
+			s.cmdBuf = bytes.Buffer{}
+		}
+		s.cmdBuf.Reset()
+
+		cmd, raw, err := resp.ReadCommand(ctx, s.reader, &s.cmdBuf)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				s.logger.Debug("client disconnected")
@@ -99,8 +113,6 @@ func (s *Session) Run(ctx context.Context) error {
 			s.logger.Error("read command", "err", err)
 			return err
 		}
-
-		s.logger.Debug("received command", "cmd", cmd)
 
 		primary := s.pool.Primary()
 		if primary == nil {
@@ -116,7 +128,7 @@ func (s *Session) Run(ctx context.Context) error {
 			raws := [][]byte{raw}
 
 			for s.reader.Buffered() > 0 {
-				cmd2, raw2, err := resp.ReadCommand(ctx, s.reader)
+				cmd2, raw2, err := resp.ReadCommand(ctx, s.reader, &s.cmdBuf)
 				if err != nil {
 					break
 				}
@@ -158,7 +170,7 @@ func (s *Session) Run(ctx context.Context) error {
 
 func (s *Session) processCommand(ctx context.Context, primary *backend.Backend, cmd string, raw []byte) error {
 	if !supportedCommands[cmd] {
-		_, err := s.writer.Write([]byte(fmt.Sprintf("-ERR unsupported command '%s'\r\n", cmd)))
+		_, err := fmt.Fprintf(s.writer, "-ERR unsupported command '%s'\r\n", cmd)
 		if err == nil {
 			err = s.writer.Flush()
 		}
@@ -195,7 +207,7 @@ func (s *Session) processCommand(ctx context.Context, primary *backend.Backend, 
 	}
 
 	if standbyForwardCommands[cmd] && s.txConn == nil {
-		s.forwardToStandbys(ctx, cmd, raw)
+		s.forwardToStandbys(raw)
 	}
 
 	_, err := s.writer.Write(reply)
@@ -231,25 +243,17 @@ func (s *Session) processBatch(ctx context.Context, primary *backend.Backend, cm
 			return err
 		}
 		if standbyForwardCommands[cmds[i]] {
-			s.forwardToStandbys(ctx, cmds[i], raws[i])
+			s.forwardToStandbys(raws[i])
 		}
 	}
 	return s.writer.Flush()
 }
 
-func (s *Session) forwardToStandbys(ctx context.Context, cmd string, raw []byte) {
-	standbys := s.pool.Standbys()
-	for _, b := range standbys {
-		if !b.IsConnected() {
-			continue
-		}
-		b := b
-		go func() {
-			if _, err := b.Forward(ctx, raw); err != nil {
-				s.logger.Warn("standby forward failed", "standby", b.Name, "cmd", cmd, "err", err)
-			}
-		}()
+func (s *Session) forwardToStandbys(raw []byte) {
+	if s.forwarder == nil || !s.forwarder.HasStandbys() {
+		return
 	}
+	s.forwarder.Submit(raw)
 }
 
 var now = func() time.Time { return time.Now() }

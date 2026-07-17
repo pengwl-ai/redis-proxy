@@ -79,15 +79,21 @@ func (b *Backend) SetOnDisconnect(fn func()) {
 }
 
 func (b *Backend) dial(ctx context.Context) (*pooledConn, error) {
-	var d net.Dialer
+	d := net.Dialer{
+		Timeout:   5 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
 	conn, err := d.DialContext(ctx, "tcp", b.Addr)
 	if err != nil {
 		return nil, err
 	}
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+	}
 	return &pooledConn{
 		conn:   conn,
-		reader: bufio.NewReaderSize(conn, 64*1024),
-		writer: bufio.NewWriterSize(conn, 64*1024),
+		reader: bufio.NewReaderSize(conn, 8*1024),
+		writer: bufio.NewWriterSize(conn, 8*1024),
 	}, nil
 }
 
@@ -98,6 +104,7 @@ func (b *Backend) acquire(ctx context.Context) (*pooledConn, error) {
 
 	select {
 	case pc := <-b.pool:
+		pc.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		return pc, nil
 	default:
 	}
@@ -120,6 +127,7 @@ func (b *Backend) acquire(ctx context.Context) (*pooledConn, error) {
 
 	select {
 	case pc := <-b.pool:
+		pc.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		return pc, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -261,7 +269,7 @@ func (b *Backend) Forward(ctx context.Context, raw []byte) ([]byte, error) {
 		return nil, fmt.Errorf("backend %s flush: %w", b.Name, err)
 	}
 
-	msg, err := resp.ReadMessage(ctx, pc.reader)
+	reply, err := resp.ReadRawReply(pc.reader)
 	if err != nil {
 		b.removeConn(pc)
 		b.tryReconnect()
@@ -269,7 +277,7 @@ func (b *Backend) Forward(ctx context.Context, raw []byte) ([]byte, error) {
 	}
 
 	b.release(pc)
-	return msg.Bytes(), nil
+	return reply, nil
 }
 
 // ForwardBatch sends multiple raw command bytes in pipeline and returns replies.
@@ -298,13 +306,13 @@ func (b *Backend) ForwardBatch(ctx context.Context, raws [][]byte) ([][]byte, er
 
 	replies := make([][]byte, len(raws))
 	for i := range raws {
-		msg, err := resp.ReadMessage(ctx, pc.reader)
+		raw, err := resp.ReadRawReply(pc.reader)
 		if err != nil {
 			b.removeConn(pc)
 			b.tryReconnect()
 			return nil, fmt.Errorf("backend %s batch read: %w", b.Name, err)
 		}
-		replies[i] = msg.Bytes()
+		replies[i] = raw
 	}
 
 	b.release(pc)
@@ -347,7 +355,7 @@ func (b *Backend) ForwardPinned(ctx context.Context, p *PinnedConn, raw []byte) 
 		return nil, fmt.Errorf("backend %s flush: %w", b.Name, err)
 	}
 
-	msg, err := resp.ReadMessage(ctx, pc.reader)
+	reply, err := resp.ReadRawReply(pc.reader)
 	if err != nil {
 		b.removeConn(pc)
 		p.pc = nil
@@ -355,7 +363,7 @@ func (b *Backend) ForwardPinned(ctx context.Context, p *PinnedConn, raw []byte) 
 		return nil, fmt.Errorf("backend %s read: %w", b.Name, err)
 	}
 
-	return msg.Bytes(), nil
+	return reply, nil
 }
 
 func (b *Backend) IsConnected() bool {

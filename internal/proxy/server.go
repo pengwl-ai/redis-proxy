@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/example/redis-proxy/internal/backend"
 	"github.com/example/redis-proxy/internal/config"
@@ -18,6 +19,8 @@ type Server struct {
 	pool   *backend.Pool
 	logger *slog.Logger
 
+	forwarder *standbyForwarder
+
 	mu       sync.Mutex
 	listener net.Listener
 	wg       sync.WaitGroup
@@ -25,10 +28,14 @@ type Server struct {
 }
 
 func NewServer(cfg config.ProxyConfig, pool *backend.Pool, logger *slog.Logger) *Server {
+	fw := newStandbyForwarder(pool, logger, cfg.StandbyQueueSize)
+	fw.Start()
+
 	return &Server{
-		cfg:    cfg,
-		pool:   pool,
-		logger: logger,
+		cfg:       cfg,
+		pool:      pool,
+		logger:    logger,
+		forwarder: fw,
 	}
 }
 
@@ -86,14 +93,29 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	select {
 	case <-done:
 		s.logger.Info("all sessions drained")
-		return nil
 	case <-ctx.Done():
 		s.logger.Warn("shutdown timeout, forcing close")
-		return ctx.Err()
 	}
+
+	if s.forwarder != nil {
+		s.forwarder.Close()
+	}
+
+	return nil
 }
 
+var (
+	readerPool = sync.Pool{New: func() any { return bufio.NewReaderSize(nil, 8*1024) }}
+	writerPool = sync.Pool{New: func() any { return bufio.NewWriterSize(nil, 8*1024) }}
+)
+
 func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+
 	s.mu.Lock()
 	s.nextID++
 	id := s.nextID
@@ -102,27 +124,41 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	logger := s.logger.With("session_id", id, "remote", conn.RemoteAddr())
 	logger.Info("client connected")
 
+	reader := readerPool.Get().(*bufio.Reader)
+	reader.Reset(conn)
+	writer := writerPool.Get().(*bufio.Writer)
+	writer.Reset(conn)
+
 	session := &Session{
-		id:     id,
-		conn:   conn,
-		pool:   s.pool,
-		reader: bufio.NewReaderSize(conn, 64*1024),
-		writer: bufio.NewWriterSize(conn, 64*1024),
-		logger: logger,
+		id:        id,
+		conn:      conn,
+		pool:      s.pool,
+		reader:    reader,
+		writer:    writer,
+		logger:    logger,
+		forwarder: s.forwarder,
 	}
 
-	if err := session.Run(ctx); err != nil {
+	sessionCtx, sessionCancel := context.WithCancel(ctx)
+	defer sessionCancel()
+
+	if err := session.Run(sessionCtx); err != nil {
 		if !errors.Is(err, io.EOF) && !errors.Is(err, context.Canceled) {
 			logger.Error("session error", "err", err)
 		}
 	}
+
+	reader.Reset(nil)
+	readerPool.Put(reader)
+	writer.Reset(nil)
+	writerPool.Put(writer)
+
 	logger.Info("client disconnected")
 }
 
 func isTemporaryErr(err error) bool {
-	var netErr net.Error
-	if errors.As(err, &netErr) {
-		return netErr.Timeout()
+	if ne, ok := err.(net.Error); ok {
+		return ne.Timeout()
 	}
 	return false
 }
